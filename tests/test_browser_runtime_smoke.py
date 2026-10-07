@@ -15,8 +15,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("backend", ["playwright", "camoufox"])
+@pytest.mark.parametrize("backend", ["playwright", "camoufox", "auto"])
 def test_real_browser_survives_checkout_frame_replacement(monkeypatch, tmp_path, backend):
+    if backend == "auto":
+        import camoufox
+        from camoufox.exceptions import UnknownProperty
+
+        class IncompatibleCamoufox:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                raise UnknownProperty("Unknown property navigator.appCodeName in config")
+
+        monkeypatch.setattr(camoufox, "AsyncCamoufox", IncompatibleCamoufox)
+
     monkeypatch.setattr(settings_module, "USER_DATA_DIR", tmp_path / "profiles")
     monkeypatch.setattr(settings_module.settings, "EPIC_EMAIL", "smoke@example.test")
     monkeypatch.setattr(settings_module.settings, "BROWSER_BACKEND", backend)
@@ -25,6 +38,8 @@ def test_real_browser_survives_checkout_frame_replacement(monkeypatch, tmp_path,
 
     async def scenario():
         async with browser_context.open_browser_context(headless=True) as context:
+            await context.route("http://**/*", lambda route: route.abort())
+            await context.route("https://**/*", lambda route: route.abort())
             page = await context.new_page()
             await page.set_content("<h1>Checkout host</h1>")
             await page.evaluate(
