@@ -10,6 +10,7 @@ import json
 import os
 import time
 from contextlib import suppress
+from urllib.parse import urlsplit
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 
@@ -47,24 +48,77 @@ class EpicAuthorization:
         self._totp_attempts = 0
         self._invalid_totp_rejections = 0
         self._last_captcha_totp_refresh_at = 0.0
+        self._login_generation = 0
+        self._login_requests = {}
+        self._last_login_response_at = 0.0
+
+    @staticmethod
+    def _request_identity(request):
+        return getattr(request, "_impl_obj", request)
+
+    def _on_request(self, request) -> None:
+        path = urlsplit(request.url).path
+        if request.method == "POST" and (
+            path == "/id/api/login" or path.startswith("/id/api/login/")
+        ):
+            self._login_requests[self._request_identity(request)] = (
+                self._login_generation,
+                time.monotonic(),
+            )
+
+    def _login_submission_pending(self) -> bool:
+        if not self._login_requests:
+            return False
+        oldest = min(started for _, started in self._login_requests.values())
+        if time.monotonic() - oldest > 30:
+            raise PlaywrightTimeoutError("Epic login POST did not respond within 30 seconds")
+        return True
 
     async def _on_response_anything(self, r: Response):
-        if r.request.method != "POST" or "talon" in r.url:
+        path = urlsplit(r.url).path
+        is_login = path == "/id/api/login" or path.startswith("/id/api/login/")
+        if r.request.method != "POST" or not (
+            is_login or path in {"/id/api/analytics", "/account/v2/refresh-csrf"}
+        ):
             return
 
-        with suppress(Exception):
-            result = await r.json()
-            result_json = json.dumps(result, indent=2, ensure_ascii=False)
+        generation = self._login_generation
+        identity = self._request_identity(r.request)
+        record = self._login_requests.get(identity)
+        if is_login:
+            if record is None or record[0] != generation:
+                return
+            self._last_login_response_at = time.monotonic()
 
-            if "/id/api/login" in r.url and result.get("errorCode"):
-                self._login_error_signal.put_nowait(result)
-                logger.error(f"{r.request.method} {r.url} - {result_json}")
-            elif "/id/api/analytics" in r.url and result.get("accountId"):
-                self._is_login_success_signal.put_nowait(result)
-            elif "/account/v2/refresh-csrf" in r.url and result.get("success", False) is True:
-                self._is_refresh_csrf_signal.put_nowait(result)
-            # else:
-            #     logger.debug(f"{r.request.method} {r.url} - {result_json}")
+        result = {}
+        with suppress(Exception):
+            parsed = await r.json()
+            if isinstance(parsed, dict):
+                result = parsed
+        if is_login and self._login_requests.get(identity) == record:
+            self._login_requests.pop(identity, None)
+        if generation != self._login_generation:
+            return
+
+        if is_login:
+            self._last_login_response_at = time.monotonic()
+            error_code = result.get("errorCode")
+            # Log only a status/code, never response payloads or authentication URLs.
+            logger.info(
+                "Epic login POST completed | status={} | error_code={}",
+                r.status,
+                error_code or "none",
+            )
+            if error_code:
+                self._login_error_signal.put_nowait({"errorCode": error_code})
+            elif r.status >= 400:
+                self._login_error_signal.put_nowait(
+                    {"errorCode": f"epic_login_http_{r.status}"}
+                )
+        elif path == "/id/api/analytics" and result.get("accountId"):
+            self._is_login_success_signal.put_nowait(True)
+        elif path == "/account/v2/refresh-csrf" and result.get("success") is True:
+            self._is_refresh_csrf_signal.put_nowait(True)
 
     @staticmethod
     def _drain_queue(queue: asyncio.Queue):
@@ -270,35 +324,144 @@ class EpicAuthorization:
         )
 
     async def _has_visible_hcaptcha(self) -> bool:
+        # Check the DOM as well as the URL: interactive frames can omit frame=challenge.
         for frame in self.page.frames:
-            if "hcaptcha" in (frame.url or "").lower():
-                with suppress(Exception):
-                    frame_element = await frame.frame_element()
-                    visible = await frame_element.evaluate(
-                        """
-                        (element) => {
-                          const rect = element.getBoundingClientRect();
-                          const style = window.getComputedStyle(element);
-                          return rect.width > 0 && rect.height > 0 &&
-                            style.visibility !== 'hidden' &&
-                            style.display !== 'none' &&
-                            style.opacity !== '0';
-                        }
-                        """
-                    )
-                    if visible:
-                        return True
+            frame_url = (frame.url or "").lower()
+            if "hcaptcha" not in frame_url:
+                continue
+            with suppress(Exception):
+                frame_element = await frame.frame_element()
+                bounds = await frame_element.evaluate(
+                    """
+                    (element) => {
+                      const rect = element.getBoundingClientRect();
+                      const style = window.getComputedStyle(element);
+                      return {
+                        visible: rect.width > 0 && rect.height > 0 &&
+                          style.visibility !== 'hidden' && style.display !== 'none' &&
+                          style.opacity !== '0',
+                        width: rect.width,
+                        height: rect.height
+                      };
+                    }
+                    """
+                )
+                if not bounds["visible"]:
+                    continue
+                if await frame.locator(".challenge-view").first.is_visible():
+                    return True
+                if "frame=checkbox" in frame_url or await frame.locator("#checkbox").is_visible():
+                    continue
+                # Allow a challenge-sized startup container; a small checkbox-only frame
+                # must not start a solver while its DOM is still loading.
+                if "frame=challenge" in frame_url or (
+                    bounds["width"] >= 200 and bounds["height"] >= 150
+                ):
+                    return True
+        return False
 
-        body = (await self._page_body_text()).lower()
-        return any(
-            marker in body
-            for marker in (
-                "one more step",
-                "please complete a security check",
-                "verify you are human",
-                "i am human",
+    async def _wait_for_login_challenge_settle(self) -> None:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if not self._login_error_signal.empty() or not await self._has_visible_hcaptcha():
+                return
+            await self.page.wait_for_timeout(250)
+
+    async def _activate_hcaptcha_checkbox(self, agent: AgentV) -> bool:
+        for frame in self.page.frames:
+            frame_url = (frame.url or "").lower()
+            if "hcaptcha" not in frame_url:
+                continue
+            with suppress(Exception):
+                checkbox = frame.locator("#checkbox")
+                if (
+                    await checkbox.is_visible()
+                    and await checkbox.get_attribute("aria-checked") != "true"
+                ):
+                    await agent.robotic_arm.click_by_mouse(checkbox)
+                    return True
+        return False
+
+    async def _is_email_login_step(self) -> bool:
+        with suppress(Exception):
+            return (
+                await self.page.locator("#email").is_visible()
+                and not await self.page.locator("#password").is_visible()
             )
-        )
+        return False
+
+    async def _has_incorrect_login_response(self) -> bool:
+        body = " ".join((await self._page_body_text()).casefold().split())
+        return "incorrect response" in body and "refresh" in body
+
+    async def _advance_email_login(self, agent: AgentV) -> None:
+        email_input = self.page.locator("#email")
+        await email_input.fill(settings.EPIC_EMAIL)
+        await email_input.press("Tab")
+        deadline = time.monotonic() + 300
+        submitted_at = None
+        submissions = 0
+        captcha_attempts = 0
+        checkbox_attempts = 0
+
+        while time.monotonic() < deadline:
+            if not self._login_error_signal.empty():
+                result = await self._login_error_signal.get()
+                error_code = result.get("errorCode", "epic_email_login_failed")
+                if error_code == "errors.com.epicgames.accountportal.csrf_token_invalid":
+                    await self.page.context.clear_cookies()
+                raise RuntimeError(error_code)
+            if await self._has_incorrect_login_response():
+                raise RuntimeError("Epic rejected the email challenge; restart required")
+
+            if await self._has_visible_hcaptcha():
+                captcha_attempts += 1
+                if captcha_attempts > 3:
+                    raise RuntimeError("Epic email challenge retry limit reached")
+                try:
+                    signal = await wait_for_challenge_signal(
+                        agent,
+                        context=f"login_email:{captcha_attempts}",
+                        timeout_seconds=min(
+                            settings.EXECUTION_TIMEOUT + settings.RESPONSE_TIMEOUT + 5,
+                            max(1.0, deadline - time.monotonic()),
+                        ),
+                    )
+                except Exception as err:
+                    raise RuntimeError(
+                        f"Email challenge interrupted ({type(err).__name__}); restart required"
+                    ) from err
+                if signal is not ChallengeSignal.SUCCESS:
+                    raise RuntimeError(
+                        f"Email challenge ended with {signal.value}; restart required"
+                    )
+                # Do not solve again while Epic is still consuming the previous response.
+                await self._wait_for_login_challenge_settle()
+                submitted_at = time.monotonic()
+                await self.page.wait_for_timeout(1000)
+                continue
+
+            if await self.page.locator("#password").is_visible():
+                return
+
+            if await self._is_email_login_step() and not self._login_submission_pending():
+                button = self.page.locator("#continue")
+                if await button.is_visible() and await button.is_enabled():
+                    if submitted_at is None or time.monotonic() - submitted_at >= 15:
+                        if submissions >= 2:
+                            raise RuntimeError("Epic email Continue did not advance")
+                        submissions += 1
+                        await email_input.fill(settings.EPIC_EMAIL)
+                        await button.click(timeout=5000, no_wait_after=True)
+                        submitted_at = time.monotonic()
+                elif checkbox_attempts < 2 and await self._activate_hcaptcha_checkbox(agent):
+                    checkbox_attempts += 1
+                    await self.page.wait_for_timeout(1000)
+                    continue
+
+            await self.page.wait_for_timeout(500)
+
+        raise PlaywrightTimeoutError("Timed out advancing the Epic email login step")
 
     async def _wait_for_login_form(self, point_url: str) -> None:
         deadline = time.monotonic() + 45
@@ -371,6 +534,10 @@ class EpicAuthorization:
         max_totp_attempts = 6
         max_invalid_totp_rejections = 3
         captcha_totp_refresh_cooldown = 8.0
+        captcha_attempts = 0
+        password_resubmissions = 0
+        password_retry_at = started_at + 15
+        checkbox_attempts = 0
 
         def extend_deadline(reason: str, seconds: int = 120) -> None:
             nonlocal deadline
@@ -485,7 +652,14 @@ class EpicAuthorization:
 
                 raise RuntimeError(error_code)
 
-            if not self._is_login_success_signal.empty():
+            if await self._has_incorrect_login_response():
+                raise RuntimeError("Epic rejected the login challenge; restart required")
+
+            # Analytics is only a hint: Epic must also have left the login page.
+            if (
+                not self._is_login_success_signal.empty()
+                and "/id/login" not in self.page.url.lower()
+            ):
                 await self._is_login_success_signal.get()
                 return
 
@@ -500,40 +674,34 @@ class EpicAuthorization:
                 continue
 
             if await self._has_visible_hcaptcha():
+                captcha_attempts += 1
+                if captcha_attempts > 3:
+                    raise RuntimeError("Epic login challenge retry limit reached")
                 logger.warning(
-                    "Login captcha is visible during authentication outcome; solving before "
-                    "continuing | current_url='{}'",
-                    self.page.url,
+                    "Interactive login challenge detected | attempt={}/3", captcha_attempts
                 )
-                extend_deadline("captcha-visible", 180)
                 challenge_solved = False
                 try:
                     challenge_signal = await wait_for_challenge_signal(
                         agent,
-                        context="login_mfa",
+                        context=f"login_outcome:{captcha_attempts}",
                         timeout_seconds=min(
                             settings.EXECUTION_TIMEOUT + settings.RESPONSE_TIMEOUT + 5,
                             max(1.0, deadline - time.monotonic()),
                         ),
                     )
                     challenge_solved = challenge_signal is ChallengeSignal.SUCCESS
-                    if challenge_solved:
-                        extend_deadline("captcha-solved", 120)
-                    else:
-                        logger.warning(
-                            "Login captcha did not succeed during authentication outcome | "
-                            "signal={} | current_url='{}'",
-                            challenge_signal.value,
-                            self.page.url,
-                        )
                 except Exception as err:
-                    logger.warning(
-                        "Login captcha solve attempt failed during authentication outcome | err={!r}",
-                        err,
+                    raise RuntimeError(
+                        f"Login challenge interrupted ({type(err).__name__}); restart required"
+                    ) from err
+                if not challenge_solved:
+                    raise RuntimeError(
+                        f"Login challenge ended with {challenge_signal.value}; restart required"
                     )
-                    extend_deadline("captcha-attempt", 90)
+                await self._wait_for_login_challenge_settle()
 
-                if challenge_solved and self._is_mfa_page():
+                if self._is_mfa_page():
                     if await wait_for_mfa_captcha_settle():
                         await self.page.wait_for_timeout(500)
                         continue
@@ -552,12 +720,31 @@ class EpicAuthorization:
                             "Epic MFA response"
                         )
 
+                password_retry_at = time.monotonic() + 15
                 await self.page.wait_for_timeout(500)
                 continue
+
+            if await self._is_email_login_step():
+                raise RuntimeError("Epic returned to the email step; restart required")
 
             if self._is_mfa_page() and self._totp_attempts == 0:
                 await submit_fresh_totp("mfa_page")
                 continue
+
+            if not self._is_mfa_page() and "/id/login" in self.page.url.lower():
+                if not self._login_submission_pending():
+                    retry_at = max(password_retry_at, self._last_login_response_at + 15)
+                    if time.monotonic() >= retry_at:
+                        if password_resubmissions >= 1:
+                            raise RuntimeError("Epic password submission did not advance")
+                        if await self._resubmit_password_form():
+                            password_resubmissions += 1
+                            password_retry_at = time.monotonic() + 15
+                            continue
+                        if checkbox_attempts < 2 and await self._activate_hcaptcha_checkbox(agent):
+                            checkbox_attempts += 1
+                            password_retry_at = time.monotonic() + 15
+                            continue
 
             if not self._is_mfa_page() and "/id/login" not in self.page.url:
                 if "true" == await self._get_login_status(timeout_ms=500, warn_timeout=False):
@@ -570,6 +757,7 @@ class EpicAuthorization:
     async def _replace_page(self) -> None:
         old_page = self.page
         self.page = await old_page.context.new_page()
+        self.page.on("request", self._on_request)
         self.page.on("response", self._on_response_anything)
         with suppress(Exception):
             await old_page.close()
@@ -581,6 +769,8 @@ class EpicAuthorization:
         try:
             await password_input.wait_for(state="visible", timeout=1000)
             await sign_in_button.wait_for(state="visible", timeout=1000)
+            if not await sign_in_button.is_enabled() or await self._has_visible_hcaptcha():
+                return False
 
             if not await password_input.input_value(timeout=1000):
                 await password_input.fill(settings.EPIC_PASSWORD.get_secret_value())
@@ -594,7 +784,7 @@ class EpicAuthorization:
             logger.warning("Could not resubmit Epic password form after captcha reset: {!r}", err)
             return False
 
-    async def _submit_login_or_accept_challenge(self) -> None:
+    async def _submit_login_or_accept_challenge(self, agent: AgentV) -> None:
         if await self._has_visible_hcaptcha():
             logger.warning(
                 "Login hCaptcha appeared before the sign-in button click; entering solve loop"
@@ -602,9 +792,16 @@ class EpicAuthorization:
             return
 
         try:
-            await self.page.locator("#sign-in").click(timeout=10000, no_wait_after=True)
+            button = self.page.locator("#sign-in")
+            if (
+                await button.is_visible()
+                and not await button.is_enabled()
+                and await self._activate_hcaptcha_checkbox(agent)
+            ):
+                return
+            await button.click(timeout=10000, no_wait_after=True)
         except PlaywrightTimeoutError:
-            if await self._has_visible_hcaptcha():
+            if await self._has_visible_hcaptcha() or await self._activate_hcaptcha_checkbox(agent):
                 logger.warning(
                     "Login hCaptcha replaced the sign-in button during submission; "
                     "entering solve loop"
@@ -706,6 +903,9 @@ class EpicAuthorization:
         logger.debug("Login with Email")
 
         try:
+            self._login_generation += 1
+            self._login_requests.clear()
+            self._last_login_response_at = 0.0
             self._drain_queue(self._is_login_success_signal)
             self._drain_queue(self._login_error_signal)
             self._drain_queue(self._is_refresh_csrf_signal)
@@ -714,70 +914,16 @@ class EpicAuthorization:
             await self.page.goto(point_url, wait_until="domcontentloaded")
             await self._wait_for_login_form(point_url)
 
-            # 1. 使用电子邮件地址登录
-            email_input = self.page.locator("#email")
-            await email_input.fill(settings.EPIC_EMAIL)
+            # Email Continue can itself require hCaptcha before the password field appears.
+            await self._advance_email_login(agent)
 
-            # 2. 点击继续按钮
-            await self.page.click("#continue")
-
-            # 3. 输入密码
             password_input = self.page.locator("#password")
-            await expect(password_input).to_be_visible(timeout=10000)
             await password_input.fill(settings.EPIC_PASSWORD.get_secret_value())
+            await self._submit_login_or_accept_challenge(agent)
 
-            # 4. 点击登录按钮，触发人机挑战值守监听器
-            # Active hCaptcha checkbox
-            await self._submit_login_or_accept_challenge()
-
-            login_confirmed = False
-            for challenge_attempt in range(1, 4):
-                logger.debug("Solving login challenge attempt {}/3", challenge_attempt)
-                challenge_signal = ChallengeSignal.FAILURE
-                try:
-                    challenge_signal = await wait_for_challenge_signal(
-                        agent,
-                        context=f"login:{challenge_attempt}",
-                        timeout_seconds=(
-                            settings.EXECUTION_TIMEOUT + settings.RESPONSE_TIMEOUT + 5
-                        ),
-                    )
-                except Exception:
-                    pass
-
-                try:
-                    await self._await_login_outcome(point_url, agent, timeout_seconds=25)
-                    login_confirmed = True
-                    break
-                except PlaywrightTimeoutError:
-                    if await self._has_visible_hcaptcha():
-                        logger.warning(
-                            "Login outcome timed out while captcha is still visible; "
-                            "retrying solve attempt {}/3 | signal={}",
-                            challenge_attempt,
-                            challenge_signal.value,
-                        )
-                        continue
-
-                    if challenge_attempt < 3 and await self._resubmit_password_form():
-                        logger.warning(
-                            "Login captcha disappeared without authentication; resubmitted the "
-                            "password form before solve attempt {}/3",
-                            challenge_attempt + 1,
-                        )
-                        try:
-                            await self._await_login_outcome(point_url, agent, timeout_seconds=8)
-                            login_confirmed = True
-                            break
-                        except PlaywrightTimeoutError:
-                            if not await self._has_visible_hcaptcha():
-                                raise
-                        continue
-
-                    raise
-
-            if not login_confirmed:
-                await self._await_login_outcome(point_url, agent, timeout_seconds=10)
+            # One bounded observer owns challenge retries and password recovery. A solver result
+            # alone is never treated as authenticated; wait for Epic's page/session signals.
+            await self._await_login_outcome(point_url, agent, timeout_seconds=360)
             logger.success("Login success")
 
             if self._needs_mfa_setup_prompt() and not await self._dismiss_mfa_setup_prompt(
@@ -810,6 +956,7 @@ class EpicAuthorization:
             return None
 
     async def invoke(self) -> bool:
+        self.page.on("request", self._on_request)
         self.page.on("response", self._on_response_anything)
         self._totp_attempts = 0
         self._invalid_totp_rejections = 0
@@ -845,8 +992,9 @@ class EpicAuthorization:
                     attempt,
                     max_attempts,
                 )
-                with suppress(Exception):
-                    await self.page.context.clear_cookies()
+                # Preserve any session established during a late login response. The next
+                # attempt checks the store before submitting credentials again. Only explicit
+                # CSRF rejection/pre-login security recovery clears cookies.
                 await self._replace_page()
 
         logger.error("Epic Games authentication failed after {} attempts", max_attempts)

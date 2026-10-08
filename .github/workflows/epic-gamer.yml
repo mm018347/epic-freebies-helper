@@ -42,6 +42,17 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Validate Python syntax
+        run: |
+          uv run python - <<'PY'
+          import ast
+          from pathlib import Path
+          paths = sorted(Path("app").rglob("*.py"))
+          for path in paths:
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          print(f"Python syntax verified for {len(paths)} application files")
+          PY
+
       - name: Validate hCaptcha protocol contract
         env:
           PYTHONPATH: app
@@ -84,6 +95,11 @@ jobs:
           IMAGE_CLASSIFIER_MODEL: gemini-3.8-flash-high
           SPATIAL_POINT_REASONER_MODEL: gemini-3.8-flash-high
           SPATIAL_PATH_REASONER_MODEL: gemini-3.8-flash-high
+          # One 90s model attempt per image; leave room for multiple images and browser actions.
+          GLM_REQUEST_TIMEOUT_SECONDS: 90
+          EXECUTION_TIMEOUT: 240
+          RESPONSE_TIMEOUT: 30
+          AUTH_MAX_ATTEMPTS: 3
           BROWSER_BACKEND: auto
           BROWSER_PROXY: ${{ secrets.BROWSER_PROXY }}
           HEADLESS: virtual
