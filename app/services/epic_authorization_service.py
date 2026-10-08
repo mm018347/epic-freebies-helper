@@ -386,7 +386,7 @@ class EpicAuthorization:
         with suppress(Exception):
             return (
                 await self.page.locator("#email").is_visible()
-                and not await self.page.locator("#password").is_visible()
+                and await self.page.locator("#continue").is_visible()
             )
         return False
 
@@ -441,16 +441,28 @@ class EpicAuthorization:
                 await self.page.wait_for_timeout(1000)
                 continue
 
-            if await self.page.locator("#password").is_visible():
+            email_step = await self._is_email_login_step()
+            # Epic can expose a password marker before Continue has advanced the email form.
+            # Require a Continue submission and disappearance of the email-stage control.
+            if (
+                submissions > 0
+                and not await self.page.locator("#continue").is_visible()
+                and await self.page.locator("#password").is_visible()
+            ):
+                logger.debug(
+                    "Epic login phase advanced from email to password | sign_in_visible={}",
+                    await self.page.locator("#sign-in").is_visible(),
+                )
                 return
 
-            if await self._is_email_login_step() and not self._login_submission_pending():
+            if email_step and not self._login_submission_pending():
                 button = self.page.locator("#continue")
                 if await button.is_visible() and await button.is_enabled():
                     if submitted_at is None or time.monotonic() - submitted_at >= 15:
                         if submissions >= 2:
                             raise RuntimeError("Epic email Continue did not advance")
                         submissions += 1
+                        logger.debug("Submitting Epic email Continue | attempt={}/2", submissions)
                         await email_input.fill(settings.EPIC_EMAIL)
                         await button.click(timeout=5000, no_wait_after=True)
                         submitted_at = time.monotonic()
