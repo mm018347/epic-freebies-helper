@@ -59,6 +59,17 @@
 
 两个 Secret 需要同时存在才会发送通知。发送失败不会影响领取任务；未配置时保持现有行为。
 
+如需接收 WXPush（微信模板消息）领取结果通知，需要先自行部署 [wxpush](https://github.com/frankiejun/wxpush) 服务，再额外配置：
+
+| Secret | 说明 |
+| --- | --- |
+| `WXPUSH_ENDPOINT` | wxpush 服务根地址（如 `https://your-worker.workers.dev`），程序会自动补全 `/wxsend` |
+| `WXPUSH_TOKEN` | 部署 wxpush 时设置的 `API_TOKEN` |
+
+可选 Secret：`WXPUSH_USERID`（覆盖默认接收用户）、`WXPUSH_TEMPLATE_ID`（覆盖默认模板）、`WXPUSH_BASE_URL`（模板消息跳转地址，缺省用 wxpush `/skin` 页）。
+
+WXPush 与 Telegram 相互独立、可同时启用；任一渠道发送失败都不会影响领取任务。微信模板标题字段约 20 字上限且不支持换行，因此标题为单行浓缩摘要（直接带 `新领x` / `失败x` 等计数），正文为完整游戏清单；微信原生弹窗只显示正文开头约 20 字，点开消息经 wxpush `/skin` 页查看完整清单。
+
 如果共享云 IP 导致 hCaptcha 风控加重，可选添加 `BROWSER_PROXY` Secret，格式为 `http://用户名:密码@主机:端口`、`https://...`、`socks4://...` 或 `socks5://...`。未配置时网络路径保持不变。
 
 如果你使用 Gemini 官方接口：
@@ -179,7 +190,13 @@ GitHub 的共享出口 IP 可能被 Epic 风控。通常换个时间重新执行
 
 ![GLM 429 rate limit log](../../docs/images/faq/glm-429-rate-limit.png)
 
-### 4. 为什么现在默认改成每周一次
+### 4. hCaptcha 日志反复出现 GLM 超时或 HSW 解码失败
+
+先同步主仓库的最新 `master`。当前版本会把 GLM 单次请求超时明确记录为 `GLM request timed out after ...`，并限制单轮网络尝试次数，避免模型重试耗尽整个验证码时限；浏览器也会自动对 `hsw.js` 使用无压缩传输，规避 `NS_ERROR_INVALID_CONTENT_ENCODING`。
+
+这些处理不会绕过 Epic/hCaptcha 的风控。若同步后仍持续收到更难的挑战，优先检查 GLM API 是否稳定，并考虑配置 `BROWSER_PROXY`；GitHub Hosted Runner 的共享出口 IP 仍可能提高挑战难度。不要通过关闭 `glm-4.6v` thinking 来单纯换取速度，本项目的失败样本重放中，这会显著降低点选准确率。
+
+### 5. 为什么现在默认改成每周一次
 
 Epic 周免通常在每周四刷新。对大多数普通用户来说，把默认 schedule 放在周免刷新之后、每周跑一次，更省配额，也更符合实际使用习惯。
 

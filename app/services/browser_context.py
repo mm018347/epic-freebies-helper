@@ -8,9 +8,10 @@ from typing import AsyncIterator
 from urllib.parse import unquote, urlsplit
 
 from loguru import logger
-from playwright.async_api import BrowserContext, ViewportSize, async_playwright
+from playwright.async_api import BrowserContext, Route, ViewportSize, async_playwright
 from requests import HTTPError, RequestException
 
+from extensions.playwright_runtime import install_playwright_frame_guard
 from settings import RECORD_DIR, settings
 
 _VIEWPORT = ViewportSize(width=1920, height=1080)
@@ -126,6 +127,11 @@ def _playwright_launch_options(
 
 
 def _is_camoufox_bootstrap_error(err: Exception) -> bool:
+    from camoufox.exceptions import UnknownProperty
+
+    # The separately downloaded browser can reject the Python package's fingerprint schema.
+    if isinstance(err, UnknownProperty):
+        return True
     message = str(err).lower()
     if isinstance(err, HTTPError):
         return "api.github.com/repos/daijro/camoufox/releases" in message
@@ -143,8 +149,20 @@ def _is_camoufox_bootstrap_error(err: Exception) -> bool:
     )
 
 
+async def _install_hsw_identity_route(context: BrowserContext) -> None:
+    async def force_identity_encoding(route: Route) -> None:
+        headers = await route.request.all_headers()
+        headers["accept-encoding"] = "identity"
+        await route.continue_(headers=headers)
+
+    # Camoufox/Firefox can fail while decoding hCaptcha's compressed hsw.js response.
+    # Keep the workaround scoped to that script instead of changing all browser traffic.
+    await context.route("**/hsw.js*", force_identity_encoding)
+
+
 @asynccontextmanager
 async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserContext]:
+    install_playwright_frame_guard()
     backend = (settings.BROWSER_BACKEND or "auto").strip().lower()
     headless = resolve_headless_mode(headless)
     proxy = _browser_proxy_options()
@@ -153,6 +171,7 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
         backend = "auto"
 
     if backend in {"auto", "camoufox"}:
+        camoufox = None
         try:
             from camoufox import AsyncCamoufox
 
@@ -162,6 +181,10 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
             camoufox = AsyncCamoufox(**_camoufox_launch_options(camoufox_headless, proxy))
             browser = await camoufox.__aenter__()
         except Exception as err:
+            # __aenter__ can start a Playwright driver before schema validation fails.
+            if camoufox is not None:
+                with suppress(Exception):
+                    await camoufox.__aexit__(type(err), err, err.__traceback__)
             if backend == "camoufox" or not _is_camoufox_bootstrap_error(err):
                 raise
             logger.error(
@@ -172,6 +195,7 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
                 type(err).__name__,
             )
         else:
+            await _install_hsw_identity_route(browser)
             logger.info(
                 "Browser backend active | backend=camoufox | headless_mode={} | proxy_enabled={}",
                 headless,
@@ -197,6 +221,7 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
             browser = await playwright.firefox.launch_persistent_context(
                 **_playwright_launch_options(headless, proxy, display=display)
             )
+            await _install_hsw_identity_route(browser)
             logger.warning(
                 "Browser backend active | backend=playwright-firefox | "
                 "headless_mode={} | proxy_enabled={}",

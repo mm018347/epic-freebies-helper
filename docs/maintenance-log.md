@@ -1189,3 +1189,242 @@
   - 全无效多账号配置仅在备用邮箱和密码完整时回退；否则在启动浏览器前报告明确配置错误。
   - 多账号邮箱拒绝 `/`、`\`、空白和控制字符，避免 profile 路径逃逸。
   - 增加分发器回归覆盖，验证单账号直通、原始异常对象不被替换、合法回退以及无凭据快速失败。
+
+### 2026-08-08 取消仓库自更新 Star 趋势图
+
+- 现象：
+  - Star 趋势图依赖每日 GitHub Action 生成并提交 SVG，持续制造与业务无关的提交；Fork 用户也会继承这套更新工作流。
+- 根因判断：
+  - 仓库内生成方案把展示数据维护耦合到代码仓库写权限；Star History 当前 `/svg` 接口可直接提供带 CDN 缓存的动态明暗主题图，无需仓库自行更新。
+- 改动文件：
+  - `.github/workflows/update-star-history.yml`（删除）
+  - `scripts/generate_star_history.py`（删除）
+  - `docs/images/star-history-light.svg`（删除）
+  - `docs/images/star-history-dark.svg`（删除）
+  - `README.md`
+  - `README.en.md`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 中英文 README 直接引用 Star History 托管的动态 SVG，并保留明暗主题适配。
+  - 仓库和 Fork 不再包含 Star 图定时任务，不需要 `contents: write` 权限，也不会再产生 `chore: update star history chart` 提交。
+  - Star 趋势展示改为第三方可用性依赖；即使外链暂时不可用，也不会影响领取工作流或修改仓库内容。
+
+### 2026-08-08 修复 checkout 容器等待放大至任务超时
+
+- 现象：
+  - Actions run `31149757724` 在成功打开 Beacon Pines checkout 并多次处理 hCaptcha 后，持续输出 `Primary buttons not found in checkout containers`，最终在 60 分钟 job timeout 时被取消，后续周免未处理。
+- 根因判断：
+  - checkout 等待循环使用手工累加的固定步长统计耗时，但一次容器扫描会按 frame、按钮和 locator timeout 串行放大；日志中标称 1 秒的轮询实际可耗时约 60–90 秒。
+  - `_observe_checkout_outcome()` 在没有发现领取成功、安全检查或 checkout 按钮时仍固定返回 `checkout`，把空白/失效弹窗误判为可继续提交。
+  - 四轮即时结账按状态机循环次数计数，单纯恢复 hCaptcha 的轮次也会消耗一次提交机会；本次实际只提交两次便进入漫长核验。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `tests/test_checkout_state_machine.py`
+  - `tests/test_helper_env_generator.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 容器扫描、checkout ready、购买状态和提交结果观察统一改用 `time.monotonic()` 的真实截止时间；单次扫描共享总预算，不再按 frame 倍增。
+  - 没有发现有效 checkout 容器时返回 `pending`，并以最后一次扫描状态为准；hCaptcha 消失后必须恢复到 `claimed` 或 `checkout` 才视为成功，空白弹窗会进入有界最终核验。
+  - 仅实际点击 `Add to library` / `Place order` 时增加提交计数，安全检查恢复不再吞掉四次提交额度。
+  - 单商品即时 checkout 增加 15 分钟总时间盒，最终核验中的 checkout 恢复每次限制为 2 分钟，避免单个商品占满 60 分钟任务。
+  - 新增容器总预算、pending 判定及安全检查/提交计数回归测试。
+  - env generator 测试改在 pytest 临时目录输出并增加断言，完整测试不再污染仓库的 `docker/` 目录。
+
+### 2026-08-08 修复可见 Add to library 按钮未被 checkout 扫描命中
+
+- 现象：
+  - Actions run `31257535606` 的失败截图中 checkout 弹窗及 `Add to library` 按钮已经可见，但程序仍连续报告 `Primary buttons not found in checkout containers`，最终核验失败。
+  - 上一轮修复仅通过状态机单元测试，没有使用本地真实账号完成端到端领取验证。
+- 根因判断：
+  - 本地 Camoufox 探针确认真实 purchase frame 中提交按钮的复合选择器、大小写不敏感正则和标题文本定位都返回一个元素，DOM 和选择器本身并未缺失。
+  - 当前 Playwright 1.53 的 `Locator.is_visible(timeout=...)` 会把已声明为忽略的 `timeout` 参数继续传给不接受该参数的 `Frame.is_visible()`，实际抛出 `TypeError`；结账容器扫描的宽泛异常处理吞掉该错误后，将“按钮可见但可见性检查异常”误报成“按钮不存在”。
+  - 早期后备定位同时使用区分大小写的精确文本匹配和全大写常量，无法命中页面实际的 `Add to library` 文本；失败工件又会在任一 frame 读取异常时遗漏整个 frame，掩盖了上述证据。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `tests/test_checkout_state_machine.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 直接把 `webPurchaseContainer` 的 `FrameLocator` 放在扫描首位，再使用 URL 和文本启发式作为回退，避免不必要的 frame handle 转换。
+  - 在读取 frame body 前先扫描可见提交控件，并以大小写不敏感的精确 `Add to library` / `Place order` 正则作为后备入口后向上寻找可点击祖先；移除 Epic 领取路径中传给 `Locator.is_visible()` 的无效 timeout 参数。
+  - 失败工件逐 frame 记录去除查询参数后的 URL、可见操作控件和探测异常；单个 frame 失败不再导致该 frame 从报告中消失。
+  - 本地真实 Camoufox 流程已从持续报告按钮不存在恢复为命中 `ADD TO LIBRARY` 并执行提交；实际领取被账号 24 小时免费游戏限流阻断，未将其误报为领取成功。
+  - 增加 hCaptcha frame 共存、标题大小写文本和 Playwright 无参数可见性调用的回归覆盖。
+
+### 2026-08-08 识别 Epic 账号 24 小时免费游戏领取限流并快速终止
+
+- 现象：
+  - 本地真实 checkout 点击 `Add to library` 后同时出现 hCaptcha 和提示 `Your account is unable to download any more free games ... please wait 24 hours`，程序仍进入挑战求解及重复提交。
+- 根因判断：
+  - 该提示是 Epic 对账号施加的免费游戏领取限流，继续求解 hCaptcha、重试按钮或最终核验都无法完成本次领取。
+  - 现有状态机只有 `claimed`、`security`、`checkout` 和 `pending` 状态，没有账号级不可恢复终止状态，因此把限流场景当作可恢复安全检查。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `tests/test_checkout_state_machine.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 仅在完整匹配“无法继续领取免费游戏”和“等待 24 小时”两段固定文案时判定账号限流，避免普通错误误判。
+  - 在购买状态等待、提交后观察和 hCaptcha 求解前优先检查限流，并通过专用异常穿透 checkout fallback，立即终止本次任务且保留调试截图。
+  - 限流不会被标记为领取成功，也不会继续消耗挑战 API、提交次数或任务总时长。
+
+### 2026-08-08 修正 GitHub Actions 失败后的最终领取结论
+
+- 现象：
+  - 领取进程因 Epic 24 小时账号限流退出后，工作流只有 `if: success()` 的成功摘要，没有在 Actions 最终摘要中明确说明本次未领取成功。
+- 根因判断：
+  - Python 进程和 Telegram 已把限流作为失败处理，但 GitHub Actions 缺少对应的 `if: failure()` Step Summary，用户只能从长错误堆栈中判断最终结果。
+- 改动文件：
+  - `.github/workflows/epic-gamer.yml`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 工作流失败后检查本次日志和 runtime 工件；命中 Epic 限流固定文案时，明确显示受影响账号未确认领取成功并建议至少等待 24 小时。
+  - 其他失败显示通用“领取未完成”摘要并引导查看失败步骤和上传工件；成功摘要仍只在任务成功时执行。
+
+### 2026-08-08 将 Epic 24 小时封控改为绿色终止分支
+
+- 现象：
+  - 账号已明确进入 Epic 24 小时免费游戏领取封控后，继续运行验证码没有意义；上一版虽然会停止验证码和重试，但仍让 Action 以红色失败结束。
+- 根因判断：
+  - 封控不是程序故障，而是当前账号暂时不可领取的预期业务终止状态；专用限流异常尚未在部署编排层转换为正常终止结果。
+  - 直接把所有领取异常改成绿色会掩盖真实故障，因此只能特殊处理 `EpicFreeGameRateLimitError` 及其被通知汇总异常包装后的 cause 链。
+- 改动文件：
+  - `app/deploy.py`
+  - `app/services/epic_collection_summary_service.py`
+  - `.github/workflows/epic-gamer.yml`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 单账户检测到 24 小时封控后立即结束浏览器流程、不再重试，并由部署层转换为正常返回，使 Action 保持绿色；其他异常仍抛出并保持红色。
+  - 启用 Telegram 时直接生成“未确认领取”的限流通知摘要，不再执行封控后的订单历史核验，随后立即关闭浏览器。
+  - 多账户中的封控账号单独计为 `rate-limited`，不计入领取成功，也不阻断其他账号；只有真实失败账号才让整个 Action 失败。
+  - 绿色 Action 的最终摘要会优先识别限流日志并显示“正常结束但本次领取未成功”，不会进入普通成功领取提示。
+
+### 2026-08-11 收紧 GLM 动物计数多选提示与点选推理模式
+
+- 现象：
+  - 动物计数类 hCaptcha 多选题同时展示左侧可选网格和右侧示例动物、数量徽标；通用多选提示未明确两者的交互边界，模型可能将右侧参考内容当作可点击目标。
+  - 当前 GLM 4.5 思考模式会对所有结构化题型统一开启；点选题通常需要在较短的 hCaptcha 响应窗口内返回坐标，额外推理会增加超时风险。
+- 根因判断：
+  - 多选提示只要求返回全部目标，缺少“参考栏不可点击”和“按数量精确选择左侧网格”的约束。
+  - thinking payload 只按模型和配置开关判断，没有按 `points` 与 `paths` schema 区分延迟需求。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `tests/test_glm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 多选提示明确将右侧动物/数量栏定义为不可点击参考区，要求只从左侧网格按指定数量返回目标中心点。
+  - GLM 4.5 的点选 schema 关闭 thinking；拖拽 schema 保持开启，GLM 4.6 的既有行为不变。
+  - 新增提示注入和 thinking-mode 分支回归测试，覆盖点选、拖拽和 GLM 4.6 保持默认行为。
+
+### 2026-08-14 修复 hCaptcha HSW 解码、GLM 超时预算和越界点击
+
+- 现象：
+  - Actions run `31766718025` 在登录 hCaptcha 阶段运行约 25 分钟后失败；同一轮任务中多次出现 GLM 约 50 秒读取超时、`HSW reverse failed` 和挑战执行超时。
+  - Firefox 读取 `/hsw.js` 正文时报 `NS_ERROR_INVALID_CONTENT_ENCODING`，随后 payload/count 为空，确定性求解器无法使用。
+  - 动物计数题真实截图中的参考条在左、可点击网格在右，但旧提示词写成相反方向；模型还返回过超出挑战框下沿的 `y=809` 坐标，旧流程会直接点击。
+- 根因判断：
+  - Camoufox/Firefox 对该次压缩的 HSW 响应解码失败；问题位于浏览器响应正文读取层，不是 HSW 算法本身。
+  - GLM 50 秒客户端时限叠加上游三次网络重试和固定等待，最坏耗时超过 hCaptcha 单轮 120 秒执行时限；日志只打印空的 `ReadTimeout` 文本，难以辨认。
+  - 点选流程缺少挑战框/可点击区域校验，计数题提示又错误依赖固定左右布局，模型的参考条和越界坐标都可能进入鼠标点击。
+- 改动文件：
+  - `app/services/browser_context.py`
+  - `app/extensions/llm_adapter.py`
+  - `app/extensions/hcaptcha_adapter.py`
+  - `tests/test_browser_context.py`
+  - `tests/test_glm_adapter.py`
+  - `tests/test_hcaptcha_adapter.py`
+  - `.github/workflows/README.md`
+  - `.github/workflows/README.en.md`
+  - `docs/hcaptcha-reliability-plan.md`
+  - `.gitignore`
+- 处理结果：
+  - 仅对 `hsw.js` 强制无压缩传输，保留其他请求头和网络行为；真实 Camoufox 探针读取到 HTTP 200、1,220,616 字节正文，且响应不再包含 `content-encoding`。
+  - GLM 超时异常包含时限和异常类型，上游网络尝试从三次限制为两次；保留 GLM 4.6 thinking，因为失败截图重放显示全局关闭会降低坐标准确率。
+  - 计数题提示改为方向无关；通过重复数量徽标识别参考条方向并约束另一侧网格。所有点选答案在缓存和点击前验证挑战边界，计数题额外验证可点击网格，越界答案直接拒绝。
+  - 无效的标量拖拽坐标提前报告为结构错误；新增浏览器请求头、超时信息、重试预算、左右参考条和越界坐标回归覆盖。
+  - 本地定向测试 `35 passed`，完整测试 `60 passed`，Ruff、变更文件 Black 和 `git diff --check` 均通过。
+
+### 2026-09-06 为 GitHub Issues 增加独立的功能建议入口
+
+- 现象：
+  - Issue #28 的微信通知功能建议使用了 Bug 表单，被要求填写 Actions 运行链接、Fork 可见性和复现步骤，并自动添加了 `bug` 标签。
+- 根因判断：
+  - 仓库仅提供中英文 Bug 表单，且关闭了空白 Issue，缺少专门用于新功能和改进建议的入口。
+- 改动文件：
+  - `.github/ISSUE_TEMPLATE/03-feature-request-zh.yml`
+  - `.github/ISSUE_TEMPLATE/04-feature-request-en.yml`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 新增中英文 Feature 表单，标题使用 `[Feature]` 前缀，并复用仓库已有的 `enhancement` 标签。
+  - 仅要求描述使用场景和期望功能；替代方案、配置兼容性与相关资料为可选项，不要求失败运行链接或复现步骤。
+  - 提醒提交者保护敏感信息，并考虑可选功能对现有单账号配置及领取流程的兼容性；原有 Bug 表单和程序运行逻辑保持不变。
+  - 表单需提交并推送到 GitHub 默认分支后，才会出现在新建 Issue 的模板选择页。
+  - YAML 解析、表单字段及必填项静态检查通过；遵守仓库约定，未执行测试或领取任务。
+
+### 2026-09-06 修复领取阶段 Firefox 失效 frame 导航导致的驱动崩溃
+
+- 现象：
+  - Actions run `33967879331` / job `101311091728` 在登录 hCaptcha 最终成功、Epic 商店会话验证完成后，领取 `Alone With You` 时失败。
+  - `Get` 点击出现 `Device not supported` 弹窗，处理 Continue 时，原始 job 日志中的 Playwright Node 驱动抛出 `TypeError: Cannot read properties of undefined (reading 'childFrames')`；随后 Python 报 `Connection closed while reading from the driver`。
+  - 错误处理中的截图也因驱动断连失败，最终异常变成 `Page.screenshot`，容易被误认为截图或验证码问题。
+- 根因判断：
+  - 此次运行使用 Playwright `1.53.0`、Camoufox Python 包 `0.4.11` 和动态下载的 Camoufox `152.0.4-beta.30`。Firefox 的导航提交事件引用了 frame 表中不存在的对象；Playwright 未做空值检查便访问 `childFrames()`，导致整个驱动退出。迟到的 iframe 导航事件可在本地安装的真实 Node 驱动代码中复现完全相同的堆栈。
+  - Python 层捕获连接异常无法恢复已退出的驱动，增加验证码重试也无法解决该崩溃。
+  - 另发现 `Get` 点击超时或设备弹窗关闭后未在下次点击前检查领取进度，可能重复提交并替换正在加载的 checkout；这是同一链路的独立重试缺口，不能仅凭现有日志认定它就是本次竞态的唯一触发原因。
+- 改动文件：
+  - `app/extensions/playwright_runtime.py`
+  - `app/extensions/playwright_frame_guard.cjs`
+  - `app/services/browser_context.py`
+  - `app/services/epic_games_service.py`
+  - `tests/test_playwright_runtime.py`
+  - `tests/test_browser_runtime_smoke.py`
+  - `tests/test_checkout_state_machine.py`
+  - `docs/advanced.md`
+  - `docs/advanced.en.md`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 两个 Firefox 后端启动驱动前加载同一窄范围保护，仅跳过不存在的 frame 的导航提交事件；有效 frame 的原始处理、worker 清理和其他异常保持不变。未修改 `.venv` 文件、全局 Node 环境、模型配置或通知配置。
+  - `Get` 重试前检查 checkout 是否已经推进；若已推进则进入结账观察，不再重复点击。诊断截图增加 5 秒时限并容忍失败，避免覆盖原始领取异常或虚报截图已保存。
+  - 按本次用户明确要求执行测试：修改前基线 `60 passed`；修复后 `EPIC_BROWSER_SMOKE=1 .venv/bin/python -m pytest -q` 为 `70 passed`，包含实际 Node 驱动崩溃复现、有效 frame 行为保留、带空格路径、重复点击防护，以及两个真实浏览器的 iframe 替换检查。
+  - 本地真实 Camoufox 流程复用已有登录态，在 `Get`、设备不支持弹窗、`Add to library` 后确认 `IN LIBRARY`，领取进程 exit code 0；另起浏览器只读核对 Epic 订单历史，确认 `Alone With You` 对应记录存在。
+  - 普通 Playwright Firefox 的真实登录对照仍因登录未完成而失败，未将其转为成功。本次未重新验证全新会话的完整 hCaptcha 登录路径，也未重跑 GitHub Actions；不能把本地结果等同于云端所有网络环境均已通过。
+  - Ruff、Black、Node 语法检查、hCaptcha 协议契约检查及 `git diff --check` 通过；中英文排障文档补充原始驱动日志的定位方法和升级 Playwright 后的复验要求。
+
+### 2026-09-06 增加可选 WXPush 微信通知并隔离通知异常（PR #29）
+
+- 现象：
+  - Issue #28 希望通过微信接收领取结果；原有通知渠道仅支持 Telegram。
+  - PR #29 初版中，错误的 `WXPUSH_ENDPOINT`（如 `https://[broken`）可能在通知异常保护之外触发 URL 解析异常，覆盖领取结果或阻断限流后的正常返回。
+  - 初版未验证响应是否符合 WXPush 成功协议，误配为 `/skin` 页面时，即使接口返回 HTTP 200 HTML、没有发送消息，也可能记录发送成功。
+- 根因判断：
+  - 通知端点仅检查是否包含 `://`，未完整保护地址解析、消息构造及响应读取；HTTP 请求成功也不等同于微信推送成功。
+  - 新渠道必须复用现有领取摘要和账号标签，并保持可选配置，不能把配置错误、网络或推送服务故障转换成领取任务失败。
+- 改动文件：
+  - `app/services/wxpush_notification_service.py`
+  - `app/deploy.py`
+  - `tests/test_wxpush_notification.py`
+  - `.github/workflows/epic-gamer.yml`
+  - `.github/workflows/README.md`
+  - `.github/workflows/README.en.md`
+  - `README.md`
+  - `README.en.md`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 新增面向自托管 `frankiejun/wxpush` 的可选通知渠道。仅在 Token 和可解析的 HTTP(S) 端点同时配置时启用；未配置时不新增通知请求，保持原单账号和 Telegram 路径。
+  - 复用 `CollectionSummary`，向已配置渠道发送同一领取摘要；多账号正文使用现有打码标签。标题限制为 20 字，正文超过 500 字时按行截断并标记；中英文文档说明所需 Secrets、服务部署及微信模板限制。
+  - URL 解析拒绝已识别的非法地址，消息构造、HTTP 发送及响应读取异常均作为通知警告处理。仅接受 JSON 对象中以 `Successfully sent messages` 开头的 `msg` 作为服务端成功确认；HTML、无效 JSON 或未确认成功的响应不再记录成功日志。
+  - 限流仍先发送包含失败原因的摘要，再返回 `rate_limited` 正常结束；不会把限流记为领取成功，其他领取异常仍保持失败。未改动登录、hCaptcha、浏览器或 checkout 业务逻辑，保留 `master` 的 `70354be` 浏览器修复。
+  - 对最新 PR 代码完成静态复审，并核对 WXPush 上游 `/wxsend` 响应协议；Ruff、Black、Python 语法、工作流 YAML 和 `git diff --check` 检查通过。
+  - 按仓库规则，本轮未执行测试或真实微信投递。新增文件包含 29 个测试定义，但仍缺少发送异常、双渠道调度及限流返回值的集成回归覆盖；不能将此前浏览器修复的 70 项测试结果视为本 PR 的验证结果。
+
+### 2026-10-06 Fork update from upstream and browser bootstrap recovery
+
+- Symptom: the October 1 Actions run failed before login with Camoufox `UnknownProperty: Unknown property navigator.appCodeName in config`. The user also requested the exact execution model `gemini-3.8-flash-high`.
+- Root-cause assessment: the browser downloaded separately from the locked Camoufox 0.4.11 / BrowserForge 1.2.4 packages changed between successful and failing runs. The upstream bootstrap classifier did not recognize this schema mismatch. Camoufox issue #835 also reports the error with Python package 0.5.7 and browser beta.34; upgrading to that pair is not a verified fix.
+- Upstream provenance: GitHub parent and source both identify `Ronchy2000/epic-freebies-helper`. Updated the fork from `2c8a57d24cb5ec2d86c58cfa3a59d109cd1e898e` to upstream `d90190bf3f9f87e9da71c50c81f155c4586bdb33` (18 commits, no fork-only commits or merge conflicts). This includes checkout recovery, accurate outcome reporting, optional WXPush, Firefox frame guarding and removal of StarHistory automation. Dependency locks, schedule, provider, endpoint and credential references are retained.
+- Additional changed files: `app/services/browser_context.py`, `.github/workflows/epic-gamer.yml`, `tests/test_browser_context.py`, `tests/test_browser_runtime_smoke.py`, `tests/test_workflow_model.py`, and this log.
+- Browser behavior: `auto` recognizes the actual Camoufox `UnknownProperty` exception and uses the existing Playwright Firefox fallback. A partially entered Camoufox context is cleaned up before propagating an error or starting fallback. Explicit `camoufox` still fails, and unrelated errors remain visible. This is recovery from an incompatible browser download, not proof that the original Camoufox pair is repaired or that a live Epic login succeeds.
+- Model behavior: this fork's scheduled/manual workflow explicitly sets `GEMINI_MODEL`, `GLM_MODEL`, `CHALLENGE_CLASSIFIER_MODEL`, `IMAGE_CLASSIFIER_MODEL`, `SPATIAL_POINT_REASONER_MODEL` and `SPATIAL_PATH_REASONER_MODEL` to `gemini-3.8-flash-high`. Existing repository model variables/secrets no longer override these six fields. Provider, both API endpoint references and credentials are unchanged. Local/Docker defaults are unchanged. Runtime configuration tests cover both provider routes; availability of this exact model at the user's endpoint is unverified and no model request was sent.
+- Endpoint evidence: the October 1 job uses the GLM adapter, with `GLM_BASE_URL` masked by GitHub and `GEMINI_BASE_URL` empty. The user's stored endpoint cannot be recovered from those logs. The code default `https://open.bigmodel.cn/api/paas/v4` is not evidence of the saved secret value.
+- Validation (explicitly authorized for this task despite the repository's default no-test guidance): Python 3.13.0 with `uv sync --frozen --group dev`; full unit suite 102 passed, 3 opt-in browser cases skipped; focused Ruff, Black, hCaptcha enum/protocol contract and `git diff --check` passed. Initial sandbox-only log-directory failures were resolved by approved local test execution. Browser verification is recorded separately below after completion.
+- Safety and publication: no account login, live CAPTCHA solving, claim, workflow dispatch, workflow enablement or default-branch merge. Remote publication is paused pending explicit user authorization; no PR or remote CI result is claimed.
+- Browser verification completed: Playwright Firefox 139.0 (build 1488), ffmpeg 1011, Windows headless, disposable profiles. `EPIC_BROWSER_SMOKE=1 python -m pytest tests/test_browser_runtime_smoke.py -k "not camoufox" -q` passed 2 cases (1 native Camoufox case deselected): direct Firefox and real Firefox reached through an injected Camoufox `UnknownProperty`. Both survived local iframe replacement and further data-page navigation; HTTP/HTTPS page requests were blocked. The actual Camoufox binary combination and Linux/Xvfb Actions runtime remain untested. No Epic, model-provider or CAPTCHA service call was performed.
+- Additional verification: all 21 application Python files parsed successfully. Existing workflow triggers were inspected: Epic uses schedule/manual dispatch; Docker build/publish uses release publication. There is no push/PR-triggered test CI in the checked upstream snapshot.

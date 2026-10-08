@@ -59,6 +59,17 @@ To receive Telegram claim summaries, optionally configure:
 
 Both Secrets must be present before a notification is sent. Delivery failures do not affect the claim task; when they are absent, the existing behavior remains unchanged.
 
+To also receive WXPush (WeChat template message) claim summaries, deploy your own [wxpush](https://github.com/frankiejun/wxpush) service first, then add these Secrets:
+
+| Secret | Description |
+| --- | --- |
+| `WXPUSH_ENDPOINT` | wxpush service root (for example `https://your-worker.workers.dev`); `/wxsend` is appended automatically |
+| `WXPUSH_TOKEN` | The `API_TOKEN` you set when deploying wxpush |
+
+Optional Secrets: `WXPUSH_USERID` (overrides default recipients), `WXPUSH_TEMPLATE_ID` (overrides default template), `WXPUSH_BASE_URL` (tap-through URL; defaults to the wxpush `/skin` page).
+
+WXPush is independent from Telegram and both can be enabled at once; a delivery failure on either channel never affects the claim task. WeChat template title fields are limited to about 20 characters without newlines, so the title is a dense single-line summary carrying the key counts (`new x` / `failed x`); the content carries the full game list. WeChat native popups show only the first ~20 characters of the content — tap the message to open the wxpush `/skin` page for the complete list.
+
 If shared cloud IP reputation causes harder hCaptcha challenges, you may optionally add a `BROWSER_PROXY` Secret in the form `http://username:password@host:port`, `https://...`, `socks4://...`, or `socks5://...`. Browser networking is unchanged when it is absent.
 
 If you use the official Gemini API:
@@ -187,7 +198,13 @@ Example log for a 429 rate-limit case:
 
 ![GLM 429 rate limit log](../../docs/images/faq/glm-429-rate-limit.png)
 
-### 4. Why is the default schedule weekly now?
+### 4. hCaptcha repeatedly logs GLM timeouts or HSW decoding failures
+
+Sync the latest `master` from the upstream repository first. The current version reports a single GLM timeout as `GLM request timed out after ...` and limits network attempts so retries cannot consume the entire challenge budget. It also requests `hsw.js` without compression to avoid `NS_ERROR_INVALID_CONTENT_ENCODING` in Camoufox/Firefox.
+
+These safeguards do not bypass Epic or hCaptcha risk controls. If difficult challenges continue after syncing, verify GLM API stability and consider configuring `BROWSER_PROXY`; GitHub-hosted runners still use shared outbound IPs that may increase challenge difficulty. Do not disable `glm-4.6v` thinking just to reduce latency: replaying this failure sample showed materially worse point-selection accuracy with thinking disabled.
+
+### 5. Why is the default schedule weekly now?
 
 Epic weekly freebies usually refresh on Thursday. For most regular users, running once after the refresh is a better default: it uses fewer GitHub Actions minutes and matches the real claim cycle more closely.
 
