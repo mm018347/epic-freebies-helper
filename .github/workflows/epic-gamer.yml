@@ -87,14 +87,14 @@ jobs:
           GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
           # Fork-specific model selection: keep the provider/endpoint and credentials above.
           # Explicit role models prevent old repository variables/secrets from overriding it.
-          GEMINI_MODEL: gemini-3.8-flash-high
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
           GLM_BASE_URL: ${{ secrets.GLM_BASE_URL }}
-          GLM_MODEL: gemini-3.8-flash-high
-          CHALLENGE_CLASSIFIER_MODEL: gemini-3.8-flash-high
-          IMAGE_CLASSIFIER_MODEL: gemini-3.8-flash-high
-          SPATIAL_POINT_REASONER_MODEL: gemini-3.8-flash-high
-          SPATIAL_PATH_REASONER_MODEL: gemini-3.8-flash-high
+          GLM_MODEL: ${{ secrets.GLM_MODEL }}
+          CHALLENGE_CLASSIFIER_MODEL: ${{ secrets.CHALLENGE_CLASSIFIER_MODEL }}
+          IMAGE_CLASSIFIER_MODEL: ${{ secrets.IMAGE_CLASSIFIER_MODEL }
+          SPATIAL_POINT_REASONER_MODEL: ${{ secrets.SPATIAL_POINT_REASONER_MODEL }}
+          SPATIAL_PATH_REASONER_MODEL: ${{ secrets.SPATIAL_PATH_REASONER_MODEL }}
           # One 90s model attempt per image; leave room for multiple images and browser actions.
           GLM_REQUEST_TIMEOUT_SECONDS: 90
           EXECUTION_TIMEOUT: 240
