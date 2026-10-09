@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import ast
+import asyncio
 import base64
 import json
 import mimetypes
@@ -1242,8 +1243,11 @@ class _GLMAsyncModels:
             timeout=httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
         ) as client:
             try:
-                response = await client.post(endpoint, headers=headers, json=payload)
-            except httpx.TimeoutException as err:
+                response = await asyncio.wait_for(
+                    client.post(endpoint, headers=headers, json=payload),
+                    timeout=request_timeout,
+                )
+            except (httpx.TimeoutException, asyncio.TimeoutError) as err:
                 raise TimeoutError(
                     f"GLM request timed out after {request_timeout:g} seconds "
                     f"({type(err).__name__})"
@@ -1272,7 +1276,7 @@ class GLMCompatibleGenAIClient:
         self.aio = _GLMAsyncNamespace(settings, self._storage)
 
 
-def _limit_glm_provider_attempts(max_attempts: int = 2) -> bool:
+def _limit_glm_provider_attempts(max_attempts: int = 1) -> bool:
     try:
         from hcaptcha_challenger.tools.internal.providers.gemini import GeminiProvider
         from tenacity import stop_after_attempt
@@ -1282,6 +1286,8 @@ def _limit_glm_provider_attempts(max_attempts: int = 2) -> bool:
     retrying = getattr(GeminiProvider.generate_with_images, "retry", None)
     if retrying is None:
         return False
+    # Browser-state recovery owns retries; repeating a slow image request can consume the
+    # entire challenge deadline before subsequent images are reached.
     retrying.stop = stop_after_attempt(max_attempts)
     return True
 

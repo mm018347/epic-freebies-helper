@@ -127,6 +127,11 @@ def _playwright_launch_options(
 
 
 def _is_camoufox_bootstrap_error(err: Exception) -> bool:
+    from camoufox.exceptions import UnknownProperty
+
+    # The separately downloaded browser can reject the Python package's fingerprint schema.
+    if isinstance(err, UnknownProperty):
+        return True
     message = str(err).lower()
     if isinstance(err, HTTPError):
         return "api.github.com/repos/daijro/camoufox/releases" in message
@@ -166,6 +171,7 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
         backend = "auto"
 
     if backend in {"auto", "camoufox"}:
+        camoufox = None
         try:
             from camoufox import AsyncCamoufox
 
@@ -175,6 +181,10 @@ async def open_browser_context(headless: bool | str) -> AsyncIterator[BrowserCon
             camoufox = AsyncCamoufox(**_camoufox_launch_options(camoufox_headless, proxy))
             browser = await camoufox.__aenter__()
         except Exception as err:
+            # __aenter__ can start a Playwright driver before schema validation fails.
+            if camoufox is not None:
+                with suppress(Exception):
+                    await camoufox.__aexit__(type(err), err, err.__traceback__)
             if backend == "camoufox" or not _is_camoufox_bootstrap_error(err):
                 raise
             logger.error(
